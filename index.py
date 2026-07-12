@@ -15,19 +15,24 @@ EMBED_COLOR = discord.Color(int("323237", 16))
 FOOTER_TEXT = "Ramirez  ·  Majestic RP"
 MSK_TZ = timezone(timedelta(hours=3))
 
-HOUSE_PAYMENT_CHANNEL_ID = 1524091822190755901
-ACTIVITY_CHANNEL_ID = 1524091822190755901
+HOUSE_PAYMENT_CHANNEL_ID = 1488210182910513303
+ACTIVITY_CHANNEL_ID = 1488554549839925479
 
 PLUS_COMMAND_ROLES = [
-    1523474610971087058
+    703948034995912825,
+    703947807245074437,
+    1478490780266926231
 ]
 
 DELETE_PARTICIPANT_ROLES = [
-    1523474610971087058
+    703948034995912825,
+    703947807245074437,
+    1478490780266926231
 ]
 
-PAYMENT_ADMIN_ROLES = [
-    1523474610971087058
+ADMIN_ROLES = [
+    703948034995912825,
+    703947807245074437
 ]
 
 DATA_DIR = "data"
@@ -167,6 +172,81 @@ async def send_payment_channel(user_id: int):
             print("❌ Канал для уведомлений об оплате не найден!")
             return
     await channel.send(f"<@{user_id}>", embed=payment_embed())
+
+
+async def send_payment_notification(user_id: int, action: str, date_str: str = None):
+    """Отправляет уведомление в канал оплаты о добавлении/удалении пользователя."""
+    if not HOUSE_PAYMENT_CHANNEL_ID:
+        return
+    channel = bot.get_channel(HOUSE_PAYMENT_CHANNEL_ID)
+    if not channel:
+        try:
+            channel = await bot.fetch_channel(HOUSE_PAYMENT_CHANNEL_ID)
+        except discord.NotFound:
+            print("❌ Канал для уведомлений об оплате не найден!")
+            return
+    
+    if action == "added":
+        embed = discord.Embed(
+            title="Новый участник добавлен в список оплаты",
+            description=f"<@{user_id}> был добавлен в список оплаты дома.\n**Дата уведомления**: {date_str}",
+            color=discord.Color.green(),
+            timestamp=datetime.now(timezone.utc)
+        )
+    elif action == "removed":
+        embed = discord.Embed(
+            title="Участник удален из списка оплаты",
+            description=f"<@{user_id}> был удален из списка оплаты дома.",
+            color=discord.Color.red(),
+            timestamp=datetime.now(timezone.utc)
+        )
+    elif action == "expired":
+        embed = discord.Embed(
+            title="Автоматическое удаление (Просрочка)",
+            description=f"<@{user_id}> удален из списка, так как с даты оплаты ({date_str}) прошло более 7 дней.",
+            color=discord.Color.orange(),
+            timestamp=datetime.now(timezone.utc)
+        )
+    else:
+        return
+    
+    embed.set_footer(text=FOOTER_TEXT)
+    try:
+        await channel.send(embed=embed)
+    except Exception as e:
+        print(f"Ошибка отправки уведомления: {e}")
+
+
+def clean_expired_payments(payments: dict) -> tuple[dict, list[tuple[int, str]]]:
+    """
+    Безопасно удаляет записи, где с даты оплаты прошло более 7 дней.
+    Возвращает обновленный словарь и список кортежей (ID, Дата) удаленных пользователей.
+    """
+    now = datetime.now(MSK_TZ)
+    removed_info = [] # Храним (uid, date_str) для уведомлений
+    keys_to_remove = []
+
+    # Сначала собираем ключи для удаления, чтобы не менять словарь во время итерации
+    for uid, entry in payments.items():
+        date_str = entry.get("date")
+        if not date_str:
+            continue
+        
+        try:
+            payment_date = datetime.strptime(date_str, "%d.%m.%Y").replace(tzinfo=MSK_TZ)
+            delta = now - payment_date
+            
+            if delta.days > 7:
+                keys_to_remove.append(uid)
+                removed_info.append((int(uid), date_str))
+        except ValueError:
+            continue
+
+    # Теперь удаляем
+    for key in keys_to_remove:
+        del payments[key]
+        
+    return payments, removed_info
 
 
 async def run_payment_reminders():
@@ -438,20 +518,6 @@ def activity_panel_embed() -> discord.Embed:
     return embed
 
 
-async def post_activity_panel():
-    if not ACTIVITY_CHANNEL_ID:
-        print("❌ ACTIVITY_CHANNEL_ID не задан.")
-        return
-    channel = bot.get_channel(ACTIVITY_CHANNEL_ID)
-    if not channel:
-        try:
-            channel = await bot.fetch_channel(ACTIVITY_CHANNEL_ID)
-        except discord.NotFound:
-            print("❌ Канал активности не найден!")
-            return
-    await channel.send(embed=activity_panel_embed(), view=ActivityPanelView())
-
-
 @bot.tree.command(name="plus", description="Создает сбор с вашими настройками")
 @discord.app_commands.describe(
     название="Название сбора",
@@ -509,28 +575,42 @@ async def plus_command(interaction: discord.Interaction, название: str, 
 @bot.tree.command(name="add_payment", description="Добавить человека в список оплаты дома")
 @discord.app_commands.describe(пинг="Кого добавить для напоминаний", дата="Дата уведомления (ДД.ММ.ГГГГ)")
 async def add_payment(interaction: discord.Interaction, пинг: discord.Member, дата: str):
-    if not has_any_role(interaction.user, PAYMENT_ADMIN_ROLES):
+    if not has_any_role(interaction.user, ADMIN_ROLES):
         await interaction.response.send_message("У вас нет прав для этой команды.", ephemeral=True)
         return
     normalized = validate_date(дата)
     if not normalized:
         await interaction.response.send_message("Неверный формат даты. Используйте ДД.ММ.ГГГГ", ephemeral=True)
         return
+    
     payments = load_json(PAYMENTS_FILE, {})
-    payments[str(пинг.id)] = {
+    
+    # Проверка: если пользователь уже есть, обновляем дату, иначе добавляем
+    user_key = str(пинг.id)
+    is_update = user_key in payments
+    
+    payments[user_key] = {
         "date": normalized,
         "pinged_date": None,
         "channel_ping_date": None
     }
     save_json(PAYMENTS_FILE, payments)
-    await interaction.response.send_message(
-        f"<@{пинг.id}> добавлен в список оплаты дома на {normalized}.", ephemeral=True)
+    
+    # Отправляем уведомление в канал оплаты
+    action = "updated" if is_update else "added"
+    await send_payment_notification(пинг.id, action, normalized)
+    
+    msg_text = f"<@{пинг.id}> добавлен в список оплаты дома на {normalized}."
+    if is_update:
+        msg_text = f"Дата оплаты для <@{пинг.id}> обновлена на {normalized}."
+        
+    await interaction.response.send_message(msg_text, ephemeral=True)
 
 
 @bot.tree.command(name="delete_payment", description="Удалить человека из списка оплаты дома")
 @discord.app_commands.describe(пинг="Кого удалить из списка")
 async def delete_payment(interaction: discord.Interaction, пинг: discord.Member):
-    if not has_any_role(interaction.user, PAYMENT_ADMIN_ROLES):
+    if not has_any_role(interaction.user, ADMIN_ROLES):
         await interaction.response.send_message("У вас нет прав для этой команды.", ephemeral=True)
         return
     payments = load_json(PAYMENTS_FILE, {})
@@ -539,24 +619,51 @@ async def delete_payment(interaction: discord.Interaction, пинг: discord.Mem
         return
     payments.pop(str(пинг.id))
     save_json(PAYMENTS_FILE, payments)
+    
+    # Отправляем уведомление в канал оплаты
+    await send_payment_notification(пинг.id, "removed")
+    
     await interaction.response.send_message(f"<@{пинг.id}> удалён из списка оплаты дома.", ephemeral=True)
 
 
 @bot.tree.command(name="payment", description="Показать список людей для оплаты дома")
 async def payment_list(interaction: discord.Interaction):
     payments = load_json(PAYMENTS_FILE, {})
+    
+    # 1. Проверка на просрочку (> 7 дней) и авто-удаление
+    if payments:
+        cleaned_payments, removed_info = clean_expired_payments(payments)
+        if removed_info:
+            save_json(PAYMENTS_FILE, cleaned_payments)
+            payments = cleaned_payments 
+            # Отправляем уведомления об авто-удалении
+            for uid, date_str in removed_info:
+                await send_payment_notification(uid, "expired", date_str)
+
     if not payments:
         embed = discord.Embed(title="Оплата Дома.", description="Список пуст.", color=EMBED_COLOR)
         await interaction.response.send_message(embed=embed, ephemeral=True)
         return
+
+    # 2. Сортировка по дате (преобразуем строку даты в объект datetime для сравнения)
+    try:
+        sorted_payments = sorted(payments.items(), key=lambda item: datetime.strptime(item[1]['date'], "%d.%m.%Y"))
+    except ValueError:
+        # Если формат даты битый, сортируем как есть
+        sorted_payments = list(payments.items())
+
     lines = []
-    for i, (uid, entry) in enumerate(payments.items(), 1):
+    for i, (uid, entry) in enumerate(sorted_payments, 1):
         mark = "✅" if entry.get("pinged_date") == entry.get("date") else "❎"
+        # Используем <@UID> для упоминания. Если UID неверный, Discord покажет просто текст.
         lines.append(f"{i}.  •  <@{uid}> — {entry.get('date')} — {mark}")
+    
     embed = discord.Embed(title="Оплата Дома.", description="\n".join(lines), color=EMBED_COLOR)
+    embed.set_footer(text="Сортировка по дате оплаты")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
+# Команды /leaderbord и /activity видны всем пользователям без ограничений
 @bot.tree.command(name="leaderbord", description="Рейтинг активности в голосовых каналах")
 async def leaderbord_command(interaction: discord.Interaction):
     await respond_leaderboard(interaction)
@@ -565,6 +672,29 @@ async def leaderbord_command(interaction: discord.Interaction):
 @bot.tree.command(name="activity", description="Ваша личная статистика активности")
 async def activity_command(interaction: discord.Interaction):
     await respond_personal_activity(interaction)
+
+
+@bot.tree.command(name="post_activity_panel", description="Опубликовать панель активности в канал (Только для Админов)")
+async def post_activity_panel_command(interaction: discord.Interaction):
+    if not has_any_role(interaction.user, ADMIN_ROLES):
+        await interaction.response.send_message("У вас нет прав для использования этой команды.", ephemeral=True)
+        return
+
+    if not ACTIVITY_CHANNEL_ID:
+        await interaction.response.send_message("❌ Канал активности не настроен.", ephemeral=True)
+        return
+    
+    channel = bot.get_channel(ACTIVITY_CHANNEL_ID)
+    if not channel:
+        try:
+            channel = await bot.fetch_channel(ACTIVITY_CHANNEL_ID)
+        except discord.NotFound:
+            await interaction.response.send_message("❌ Канал активности не найден!", ephemeral=True)
+            return
+
+    await interaction.response.send_message("📢 Публикую панель активности...", ephemeral=True)
+    await channel.send(embed=activity_panel_embed(), view=ActivityPanelView())
+    await interaction.followup.send("✅ Панель успешно опубликована.", ephemeral=True)
 
 
 @bot.event
@@ -597,42 +727,6 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
             save_json(VOICE_FILE, voice_totals)
 
 
-async def console_loop():
-    loop = asyncio.get_event_loop()
-    print("\n📋 Доступные консольные команды:")
-    print("   .paytest  - Разослать напоминания об оплате для сегодняшних дат")
-    print("   .activity - Опубликовать панель активности в канал")
-    print("   exit      - Остановить бота\n")
-
-    while True:
-        try:
-            cmd = (await loop.run_in_executor(None, input, "Команда > ")).strip().lower()
-
-            if cmd == ".paytest":
-                print("🔔 Рассылка напоминаний об оплате...")
-                await run_payment_reminders()
-                print("✅ Готово.\n")
-
-            elif cmd == ".activity":
-                print("📢 Публикация панели активности...")
-                await post_activity_panel()
-                print("✅ Готово.\n")
-
-            elif cmd == "exit":
-                print("🛑 Остановка бота...")
-                flush_active_sessions()
-                await bot.close()
-                break
-
-            elif cmd:
-                print("❓ Неизвестная команда. Доступны: .paytest, .activity, exit\n")
-
-        except EOFError:
-            break
-        except Exception as e:
-            print(f"⚠️ Ошибка в консоли: {e}")
-
-
 @bot.event
 async def on_ready():
     os.system('cls' if os.name == 'nt' else 'clear')
@@ -642,7 +736,7 @@ async def on_ready():
 
     try:
         synced = await bot.tree.sync()
-        print(f"🔁 Синхронизировано {len(synced)} slash-команд.")
+        print(f" Синхронизировано {len(synced)} slash-команд.")
     except Exception as e:
         print(f"❌ Ошибка синхронизации команд: {e}")
 
@@ -664,8 +758,6 @@ async def on_ready():
     if not plus_expiry_loop.is_running():
         plus_expiry_loop.start()
         print("⏰ Цикл проверки завершения сборов запущен.")
-
-    bot.loop.create_task(console_loop())
 
 
 bot.run(TOKEN)

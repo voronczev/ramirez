@@ -64,6 +64,7 @@ def save_json(path, data):
 voice_totals = load_json(VOICE_FILE, {})
 active_sessions: dict[int, datetime] = {}
 active_plus_views: list["PlusView"] = []
+active_contract_views: list["ContractView"] = []
 
 
 def has_any_role(member, role_ids) -> bool:
@@ -284,6 +285,24 @@ async def voice_flush_loop():
 @tasks.loop(seconds=20)
 async def plus_expiry_loop():
     now = datetime.now(timezone.utc)
+    
+    # Обработка Contract View (старая логика /plus, теперь /contract)
+    for view in list(active_contract_views):
+        if view.end_time is None:
+            active_contract_views.remove(view)
+            continue
+        if now < view.end_time:
+            continue
+        if view.message is not None and view.message.embeds:
+            embed = view.message.embeds[0].copy()
+            render_contract_embed(view, embed)
+            try:
+                await view.message.edit(embed=embed, view=view)
+            except Exception as e:
+                print(f"⚠️ Не удалось обновить сбор после истечения времени: {e}")
+        active_contract_views.remove(view)
+
+    # Обработка Plus View (новая логика /plus)
     for view in list(active_plus_views):
         if view.end_time is None:
             active_plus_views.remove(view)
@@ -296,11 +315,13 @@ async def plus_expiry_loop():
             try:
                 await view.message.edit(embed=embed, view=view)
             except Exception as e:
-                print(f"⚠️ Не удалось обновить сбор после истечения времени: {e}")
+                print(f"⚠️ Не удалось обновить PLUS сбор после истечения времени: {e}")
         active_plus_views.remove(view)
 
 
-def render_plus_embed(view: "PlusView", embed: discord.Embed) -> discord.Embed:
+# --- Логика для CONTRACT (бывший /plus) ---
+
+def render_contract_embed(view: "ContractView", embed: discord.Embed) -> discord.Embed:
     members_text = "\n".join(f"<@{uid}>" for uid in view.participants) or "Пока никто не записался."
     found_index = None
     for i, field in enumerate(embed.fields):
@@ -329,16 +350,16 @@ def render_plus_embed(view: "PlusView", embed: discord.Embed) -> discord.Embed:
     return embed
 
 
-class JoinButton(discord.ui.Button):
+class ContractJoinButton(discord.ui.Button):
     def __init__(self):
-        super().__init__(label="Записаться", style=discord.ButtonStyle.primary, custom_id="plus_join_btn")
+        super().__init__(label="Записаться", style=discord.ButtonStyle.primary, custom_id="contract_join_btn")
 
     async def callback(self, interaction: discord.Interaction):
-        view: PlusView = self.view
+        view: ContractView = self.view
         if view.is_expired():
             await interaction.response.send_message("Время записи на этот сбор истекло.", ephemeral=True)
             embed = interaction.message.embeds[0].copy()
-            render_plus_embed(view, embed)
+            render_contract_embed(view, embed)
             try:
                 await interaction.message.edit(embed=embed, view=view)
             except Exception:
@@ -352,11 +373,102 @@ class JoinButton(discord.ui.Button):
             return
         view.participants.append(interaction.user.id)
         embed = interaction.message.embeds[0].copy()
-        render_plus_embed(view, embed)
+        render_contract_embed(view, embed)
         await interaction.response.edit_message(embed=embed, view=view)
 
 
-class DeleteParticipantButton(discord.ui.Button):
+class ContractDeleteParticipantButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="Удалить участника", style=discord.ButtonStyle.danger, custom_id="contract_delete_btn")
+
+    async def callback(self, interaction: discord.Interaction):
+        view: ContractView = self.view
+        if not has_any_role(interaction.user, DELETE_PARTICIPANT_ROLES):
+            await interaction.response.send_message("У вас нет прав для удаления участников.", ephemeral=True)
+            return
+        if not view.participants:
+            await interaction.response.send_message("Список участников пуст.", ephemeral=True)
+            return
+        remove_view = RemoveParticipantView(view, interaction.message, interaction.guild)
+        await interaction.response.send_message("Выберите участника для удаления:", view=remove_view, ephemeral=True)
+
+
+class ContractView(discord.ui.View):
+    def __init__(self, max_slots: int, author_id: int, end_time: datetime | None = None):
+        super().__init__(timeout=None)
+        self.max_slots = max_slots
+        self.author_id = author_id
+        self.end_time = end_time
+        self.message: discord.Message | None = None
+        self.participants: list[int] = []
+        self.join_button = ContractJoinButton()
+        self.delete_button = ContractDeleteParticipantButton()
+        self.add_item(self.join_button)
+        self.add_item(self.delete_button)
+
+    def is_expired(self) -> bool:
+        return self.end_time is not None and datetime.now(timezone.utc) >= self.end_time
+
+
+# --- Логика для NEW PLUS (/plus с ручным добавлением) ---
+
+def render_plus_embed(view: "PlusView", embed: discord.Embed) -> discord.Embed:
+    members_text = "\n".join(f"<@{uid}>" for uid in view.participants) or "Пока никто не записался."
+    found_index = None
+    for i, field in enumerate(embed.fields):
+        if field.name == "Участники":
+            found_index = i
+            break
+    if found_index is not None:
+        embed.set_field_at(found_index, name="Участники", value=members_text, inline=False)
+    else:
+        embed.add_field(name="Участники", value=members_text, inline=False)
+
+    remaining = view.max_slots - len(view.participants)
+    add_button = view.add_participant_button
+    delete_button = view.delete_button
+    
+    if view.is_expired():
+        add_button.disabled = True
+        add_button.style = discord.ButtonStyle.secondary
+        add_button.label = "Время истекло"
+        delete_button.disabled = True
+    elif remaining <= 0:
+        add_button.disabled = True
+        add_button.style = discord.ButtonStyle.secondary
+        add_button.label = "Мест нет"
+        # Delete button stays enabled to allow removal even if full
+    else:
+        add_button.disabled = False
+        add_button.style = discord.ButtonStyle.primary
+        add_button.label = "Добавить участника"
+        
+    return embed
+
+
+class PlusAddParticipantButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="Добавить участника", style=discord.ButtonStyle.primary, custom_id="plus_add_btn")
+
+    async def callback(self, interaction: discord.Interaction):
+        view: PlusView = self.view
+        if not has_any_role(interaction.user, PLUS_COMMAND_ROLES):
+            await interaction.response.send_message("У вас нет прав для добавления участников.", ephemeral=True)
+            return
+            
+        if view.is_expired():
+            await interaction.response.send_message("Время сбора истекло.", ephemeral=True)
+            return
+
+        if len(view.participants) >= view.max_slots:
+            await interaction.response.send_message("Все слоты заняты.", ephemeral=True)
+            return
+
+        add_view = AddParticipantSelectView(view, interaction.message, interaction.guild)
+        await interaction.response.send_message("Выберите участника для добавления:", view=add_view, ephemeral=True)
+
+
+class PlusDeleteParticipantButton(discord.ui.Button):
     def __init__(self):
         super().__init__(label="Удалить участника", style=discord.ButtonStyle.danger, custom_id="plus_delete_btn")
 
@@ -370,6 +482,47 @@ class DeleteParticipantButton(discord.ui.Button):
             return
         remove_view = RemoveParticipantView(view, interaction.message, interaction.guild)
         await interaction.response.send_message("Выберите участника для удаления:", view=remove_view, ephemeral=True)
+
+
+class AddParticipantSelect(discord.ui.Select):
+    def __init__(self, plus_view: "PlusView", origin_message: discord.Message, guild: discord.Guild | None):
+        self.plus_view = plus_view
+        self.origin_message = origin_message
+        
+        # Получаем всех участников сервера, которых еще нет в списке
+        all_members = guild.members if guild else []
+        options = []
+        count = 0
+        for member in all_members:
+            if member.id not in plus_view.participants and not member.bot:
+                if count >= 25: break # Discord limit for select options
+                options.append(discord.SelectOption(label=member.display_name[:100], value=str(member.id)))
+                count += 1
+                
+        super().__init__(placeholder="Выберите участника", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        if len(self.plus_view.participants) >= self.plus_view.max_slots:
+             await interaction.response.send_message("Слоты заполнились пока вы выбирали.", ephemeral=True)
+             return
+
+        uid = int(self.values[0])
+        if uid not in self.plus_view.participants:
+            self.plus_view.participants.append(uid)
+            
+        embed = self.origin_message.embeds[0].copy()
+        render_plus_embed(self.plus_view, embed)
+        await self.origin_message.edit(embed=embed, view=self.plus_view)
+        
+        member = interaction.guild.get_member(uid) if interaction.guild else None
+        name = member.display_name if member else str(uid)
+        await interaction.response.edit_message(content=f"Участник **{name}** добавлен в сбор.", view=None)
+
+
+class AddParticipantSelectView(discord.ui.View):
+    def __init__(self, plus_view: "PlusView", origin_message: discord.Message, guild: discord.Guild | None):
+        super().__init__(timeout=120)
+        self.add_item(AddParticipantSelect(plus_view, origin_message, guild))
 
 
 class RemoveParticipantSelect(discord.ui.Select):
@@ -407,9 +560,9 @@ class PlusView(discord.ui.View):
         self.end_time = end_time
         self.message: discord.Message | None = None
         self.participants: list[int] = []
-        self.join_button = JoinButton()
-        self.delete_button = DeleteParticipantButton()
-        self.add_item(self.join_button)
+        self.add_participant_button = PlusAddParticipantButton()
+        self.delete_button = PlusDeleteParticipantButton()
+        self.add_item(self.add_participant_button)
         self.add_item(self.delete_button)
 
     def is_expired(self) -> bool:
@@ -518,7 +671,63 @@ def activity_panel_embed() -> discord.Embed:
     return embed
 
 
-@bot.tree.command(name="plus", description="Создает сбор с вашими настройками")
+# --- COMMANDS ---
+
+@bot.tree.command(name="contract", description="Создает сбор с вашими настройками (Авто-запись)")
+@discord.app_commands.describe(
+    название="Название сбора",
+    дата="Дата и время окончания (ДД.ММ.ГГГГ ЧЧ:ММ)",
+    слоты="Максимальное количество участников",
+    доп_слоты="Дополнительные участники (необязательно)",
+    комментарий="Комментарий к сбору",
+    ветка="Название ветки для обсуждения",
+    изображение="Изображение для сбора"
+)
+async def contract_command(interaction: discord.Interaction, название: str, дата: str, слоты: int,
+                       доп_слоты: int = 0, комментарий: str = None, ветка: str = None,
+                       изображение: discord.Attachment = None):
+    if not has_any_role(interaction.user, PLUS_COMMAND_ROLES):
+        await interaction.response.send_message("У вас нет прав для использования этой команды.", ephemeral=True)
+        return
+    if слоты > 100:
+        await interaction.response.send_message("Максимальное количество слотов — 100.", ephemeral=True)
+        return
+
+    end_time = parse_date_to_utc(дата)
+    timer_text = get_time_remaining(end_time) if end_time else ""
+    date_value = дата + (f"\n{timer_text}" if timer_text else "")
+
+    embed = discord.Embed(title=название, color=EMBED_COLOR)
+    embed.add_field(name="Дата", value=date_value, inline=True)
+    embed.add_field(name="Слоты", value=f"{слоты} (+{доп_слоты} доп.)", inline=True)
+    embed.add_field(name="Участники", value="Пока никто не записался.", inline=False)
+    if комментарий:
+        embed.add_field(name="Комментарий", value=комментарий, inline=False)
+    embed.set_footer(text=f"{FOOTER_TEXT} · Организатор: {interaction.user.display_name}")
+    embed.timestamp = datetime.now(timezone.utc)
+    if изображение:
+        embed.set_image(url=изображение.url)
+
+    view = ContractView(max_slots=слоты, author_id=interaction.user.id, end_time=end_time)
+    view.join_button.label = f"Записаться ({слоты} мест)"
+
+    await interaction.response.send_message(
+        content="@everyone", embed=embed, view=view,
+        allowed_mentions=discord.AllowedMentions(everyone=True))
+    msg = await interaction.original_response()
+    view.message = msg
+    if end_time is not None:
+        active_contract_views.append(view)
+
+    if ветка:
+        try:
+            thread = await msg.create_thread(name=ветка, auto_archive_duration=1440)
+            await thread.send(f"Ветка для обсуждения сбора **{название}** открыта.")
+        except Exception as e:
+            await interaction.followup.send(f"Не удалось создать ветку: {e}", ephemeral=True)
+
+
+@bot.tree.command(name="plus", description="Создает сбор с ручным добавлением участников")
 @discord.app_commands.describe(
     название="Название сбора",
     дата="Дата и время окончания (ДД.ММ.ГГГГ ЧЧ:ММ)",
@@ -554,8 +763,7 @@ async def plus_command(interaction: discord.Interaction, название: str, 
         embed.set_image(url=изображение.url)
 
     view = PlusView(max_slots=слоты, author_id=interaction.user.id, end_time=end_time)
-    view.join_button.label = f"Записаться ({слоты} мест)"
-
+    
     await interaction.response.send_message(
         content="@everyone", embed=embed, view=view,
         allowed_mentions=discord.AllowedMentions(everyone=True))
